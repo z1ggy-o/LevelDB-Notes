@@ -1,0 +1,109 @@
+* LevelDB Compaction
+
+Because LevelDB uses append-only strategy to handle write request, the stale data of the same key still exists in DB files. These stale data will increase the storage cost and also degragate read perfromance. Thus, we need to remove these stale data periodically. LevelDB calls this /major compaction/.
+
+Since all data in sstable is sorted by key value, we can use k-way merge algorithm to find and remove stale data.
+
+** When to start major compaction?
+There are three situations that the background thread will start compaction:
+- The number of Level 0 sstable files exceeds a predefined threshold.
+- The size of a level exceeds a predefined threshold.
+- The number of invalid read (i.e., read miss) of a file exceeds a specific threshold.
+
+In addition to above three thresholds, users can send compaction request manually on specific level and key range.
+
+*** Triggered by Level 0 files  
+By default, when the nubmer of level 0 sstable files exceeds 4, level 0 compaction starts.
+#+begin_src cpp
+// Level-0 compaction is started when we hit this many files.
+static const int kL0_CompactionTrigger = 4;
+
+// Soft limit on number of level-0 files.  We slow down writes at this point.
+static const int kL0_SlowdownWritesTrigger = 8;
+
+// Maximum number of level-0 files.  We stop writes at this point.
+static const int kL0_StopWritesTrigger = 12;
+#+end_src
+
+Because new level 0 sstables can still be created during the compaction, LevelDB uses a throttling strategy to balance the speed between compaction and write.
+
+*** Triggered by level total size
+The predefiend max limitation of each level is computed as follows:
+#+begin_src cpp
+static double MaxBytesForLevel(const Options* options, int level) {
+  // Note: the result for level zero is not really used since we set
+  // the level-0 compaction threshold based on number of files.
+
+  // Result for both level-0 and level-1
+  double result = 10. * 1048576.0; // 10MB
+  while (level > 1) {
+    result *= 10;
+    level--;
+  }
+  return result;
+}
+#+end_src
+
+Level 1 can have 100MB data, Level 2 can have 1000MB data, and so on. The last level does not have limitation because we do not start compaction at that level.
+
+*** Triggered by miss read
+Each file has its ~FileMetaData~ that contains a ~allowed_seeks~ field to tell if we need to compact it. The reasoning about this design is as follows:
+#+begin_src cpp
+      // We arrange to automatically compact this file after
+      // a certain number of seeks.  Let's assume:
+      //   (1) One seek costs 10ms
+      //   (2) Writing or reading 1MB costs 10ms (100MB/s)
+      //   (3) A compaction of 1MB does 25MB of IO:
+      //         1MB read from this level
+      //         10-12MB read from next level (boundaries may be misaligned)
+      //         10-12MB written to next level
+      // This implies that 25 seeks cost the same as the compaction
+      // of 1MB of data.  I.e., one seek costs approximately the
+      // same as the compaction of 40KB of data.  We are a little
+      // conservative and allow approximately one seek for every 16KB
+      // of data before triggering a compaction.
+      f->allowed_seeks = static_cast<int>((f->file_size / 16384U));
+#+end_src
+
+** The process of compaction (=db_impl.h=)
+
+In [[file:memtable.org][memtable part]] and [[file:sstable.org][sstable part]] we have already learnt about compaction. Both minor compaction and major compaction start from the same entry point, ~BackgroundCompaction()~. As we already know about minor compaction, here, we focus on major compaction.
+
+Majore compactions happen on level by level, recursively. The basic idea is to find sstables with overlapped key ranges in adjacent levels, then merge them into new sstables for the higher level. As a result, the amount of data in the lower level is reduced. During the process, stale data is also removed.  
+
+*** Find target files
+As we discussed previously, we use k-way merge to do the compaction. So, the first thing we need to is to find target files that share some key ranges from the target level and the next level of it.
+
+~PickCompaction()~ find the target sstables that right follow the previous compacted key range.
+
+For non-level-0 sstables, we just pick one target files here. In terms of 
+level 0 sstables, since they may have overlapped keys, all files that have overlapped keys with the target file are picked together.
+
+Then, we will try to expand the target file sets in ~SetupOtherInputs()~. (assume the target level is L and the next level is L+1):
+1. Based on the previous selected target files, we try to find files in L that contain records that share the same user key with the largest key in the target files. As a result, all files have overlapped user keys are selected.
+2. Based on key range of L files, find files with overlapped keys in L+1.
+3. Based on selected files in L+1, go back to L to expand the file set of L, but without add new files in L+1 (otherwise, we will keep doing this until add all files, which has no meaning).
+
+*** Do compaction
+
+This process is handled by ~DoCompactionWrok()~. Basically, it is a 2-way merge that gets input from previously selected files from L and L+1.
+
+LevelDB defines a special ~MergingIterator~ to get next entry (by key order) from compaction files conveniently.
+
+For each entry, we determine to drop it or keep in new sstable files:
+- For update entries, we check if there are new versions by comparing the sequence number. Older one has smaller sequence number.
+- For deletion entrires, we only drop them when there are no existed entry in higher levels that are hidden by the deletion. (otherwise, the deleted KV will back to life!)
+
+Valid entries are added to new sstable files. These files are put into L+1.
+
+The final step is to compute score for each level and find the next level that needs compaction.
+
+*** Remove obsolete files
+
+After compaction, we can remove obsolete files by ~RemoveObsoleteFiles()~.
+
+** An optimization about compaction
+Sometimes we can move a sstable file to next level directly without merging. This happens when all of the following conditions are satisfied:
+1. We only get one file at L from ~PickCompaction()~;
+2. This file has no overlapped keys with files in L+1;
+3. The size of overlapped L+2 files with L files is less than a given threashold.  

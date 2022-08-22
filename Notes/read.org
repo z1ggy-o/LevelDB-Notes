@@ -1,0 +1,31 @@
+* LevelDB Read Path
+
+(Recommend to read other notes first because this part refers other components frequently.)
+
+LevelDB supports two kinds of reads: snapshot read and normal read.
+
+Normal read will read the lastest value of a given key; while snapshot read returns the value of the given key at the moment we send the read request (by record the sequence number in that point, records with seq number newer than that are ignored).
+
+** Read from memtable (=memtable.h=)
+We find try to find the target in the two memtables. Because these two tables are in memory, we can do comparison directly without read sstable files from disk.
+
+** Read from sstable (=version_set.h=)
+When read from sstable files, we always read files from lower levels to higher levels, from newer files to older files since the newer files contains recent data.
+
+When read files in level 0, we need to read all files because level 0 files have overlapped key ranges. For files in other levels, we just need to read one file at a time. Because all records are sorted and there is no overlapped keys, LevelDB uses binary search to find the target file (file's metadata tells lowest key and highest key in that file).
+
+Check ~Version::Get()~ to learn the details. If you already read [[file:sstable.org][sstable]] and [[file:compaction.org][compaction]] part, this process will be easy to understand.
+
+** Trigger compaction
+Read can also trigger compaction because LevelDB tracks the miss read. Check [[file:compaction.org][compaction]] for details.
+
+** Use LRUCache
+Once find the name of the file that we want to read, we use cache's API to fetch these files.
+
+The LRUCache buffers two kind of contents for us:
+- The opened file handle.
+- Data blocks of sstable files.
+
+Users can choose not to buffer data blocks to the LRU.
+
+Learn details in ~TableCache::Get()~ and ~Table::InternalGet()~.

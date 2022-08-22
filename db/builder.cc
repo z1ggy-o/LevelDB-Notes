@@ -29,7 +29,7 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     }
 
     TableBuilder* builder = new TableBuilder(options, file);
-    meta->smallest.DecodeFrom(iter->key());
+    meta->smallest.DecodeFrom(iter->key()); // entries are sorted in memtable, so the first one must be the smallest
     Slice key;
     for (; iter->Valid(); iter->Next()) {
       key = iter->key();
@@ -39,7 +39,7 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
       meta->largest.DecodeFrom(key);
     }
 
-    // Finish and check for builder errors
+    // Write out filter block, meta index block, index block and the footer
     s = builder->Finish();
     if (s.ok()) {
       meta->file_size = builder->FileSize();

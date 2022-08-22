@@ -1,0 +1,28 @@
+* LevelDB Versions
+
+Everytime LevelDB creates or deletes a sstable file, it will jump from one version to the next. In other words, sstable modification is an atomic operation for LevelDB. This makes sense, since sstable is immutable. Creating or deleting a sstable means a critical change in the DB.
+
+** Why versions?
+There is a ~VersionSet~ that contains ~Version~s for a DB. Each ~Version~ contains ~FileMetaData~ of sstables in all levels.
+
+Each version contains different sets of sstables because a new version is created when LevelDB creates or deletes sstables. Thus, a version is a sstable tracker that tells us which sstables exist in this version along with some extra metadata. Or we can treat a version as the target that we apply requests to (especially from the implementation's aspect).
+
+~VersionSet~ keeps a list of versions. We need to keep old versions because read request targets target to the /current/ version when it starts. Like MVCC, we keep these versions alive used by running iterators. A old version is deleted when the reference count of it becomes 0.
+
+** Manifest
+
+LevelDB records the incremental changes between versions. When we modify a version, the changes are recorded in a ~VersionEdit~ object. Then, the ~VersionEdit~ is converted as a log record (see [[file:logging.org][format]] here) into the manifest file.
+
+The ~descriptor_file_~ field of ~VersionSet~ points to the current manifest file. To reduce the size of the manifest file, LevelDB creates a new one everytime the user ~Open()~ a DB. The first record of the manifest file is a snapshot that contains all information about a version. The following records only need to track the modifications.
+
+** Recover
+Recover happens when open a DB. The recover process is using the information that stored in the manifest file to reconstruct a version.
+
+More specifically, LevelDB reads records from =current= file (i.e., the newest manifest file) and re-apply these records on a new version to construct the previous lastest version state.
+Note that, the records are only about editions to versions, there is nothing related to user data.
+
+After that, LevelDB deletes all out-dated manifest files to free storage space.
+
+If there is no usable manifest files, LevelDB provides a ~Repairer~ class to rebuild the DB. It will scan all sstable files by the file number order to get metadata that the DB needs. Then, treat all sstables as level 0 files.
+
+This is a expensive process since if there are more than 4 sstables, as usually do, we need to do many compactions during the process.

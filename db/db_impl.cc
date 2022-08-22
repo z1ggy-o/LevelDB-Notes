@@ -508,7 +508,7 @@ Status DBImpl::WriteLevel0Table(MemTable* mem, VersionEdit* edit,
   const uint64_t start_micros = env_->NowMicros();
   FileMetaData meta;
   meta.number = versions_->NewFileNumber();
-  pending_outputs_.insert(meta.number);
+  pending_outputs_.insert(meta.number); // gy: ongoing compaction table files, prevent from deletion
   Iterator* iter = mem->NewIterator();
   Log(options_.info_log, "Level-0 table #%llu: started",
       (unsigned long long)meta.number);
@@ -565,7 +565,7 @@ void DBImpl::CompactMemTable() {
   if (s.ok()) {
     edit.SetPrevLogNumber(0);
     edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
-    s = versions_->LogAndApply(&edit, &mutex_);
+    s = versions_->LogAndApply(&edit, &mutex_); // gy: create a new vertion here
   }
 
   if (s.ok()) {
@@ -573,7 +573,7 @@ void DBImpl::CompactMemTable() {
     imm_->Unref();
     imm_ = nullptr;
     has_imm_.store(false, std::memory_order_release);
-    RemoveObsoleteFiles();
+    RemoveObsoleteFiles(); // gy: check all files and remove obsolete ones
   } else {
     RecordBackgroundError(s);
   }
@@ -723,6 +723,7 @@ void DBImpl::BackgroundCompaction() {
         (m->end ? m->end->DebugString().c_str() : "(end)"),
         (m->done ? "(end)" : manual_end.DebugString().c_str()));
   } else {
+    // gy: find files in two adjacent levels for compaction
     c = versions_->PickCompaction();
   }
 
@@ -966,7 +967,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
                  compact->compaction->IsBaseLevelForKey(ikey.user_key)) {
         // For this user key:
         // (1) there is no data in higher levels
-        // (2) data in lower levels will have larger sequence numbers
+        // (2) data in lower levels will have larger sequence numbers // gy: means we get new insert after this deletion
         // (3) data in layers that are being compacted here and have
         //     smaller sequence numbers will be dropped in the next
         //     few iterations of this loop (by rule (A) above).
@@ -1151,6 +1152,9 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   }
 
   if (have_stat_update && current->UpdateStats(stats)) {
+    // gy: Why read also triggers compaction?
+    // Because we also track the miss read. If the number of miss read of a file exceeds the given threshold,
+    // we compact it.
     MaybeScheduleCompaction();
   }
   mem->Unref();
@@ -1203,8 +1207,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   w.sync = options.sync;
   w.done = false;
 
-  MutexLock l(&mutex_);
+  MutexLock l(&mutex_); // zgy: a wrapper that try to hold the lock in constructor and release the lock in deconstructor
   writers_.push_back(&w);
+  // zgy: waits for prev writers to finish
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
@@ -1217,7 +1222,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
-    WriteBatch* write_batch = BuildBatchGroup(&last_writer);
+    WriteBatch* write_batch = BuildBatchGroup(&last_writer); // zyg: try to group existing batches into one
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
 
@@ -1251,6 +1256,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     versions_->SetLastSequence(last_sequence);
   }
 
+  // zgy: when this will happen? Some one will push_front to the deque?
   while (true) {
     Writer* ready = writers_.front();
     writers_.pop_front();
@@ -1359,7 +1365,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       background_work_finished_signal_.Wait();
     } else {
       // Attempt to switch to a new memtable and trigger compaction of old
-      assert(versions_->PrevLogNumber() == 0);
+      assert(versions_->PrevLogNumber() == 0); // gy: 0 means there is no compacting files right now
       uint64_t new_log_number = versions_->NewFileNumber();
       WritableFile* lfile = nullptr;
       s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);

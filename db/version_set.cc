@@ -450,7 +450,7 @@ bool Version::RecordReadSample(Slice internal_key) {
   return false;
 }
 
-void Version::Ref() { ++refs_; }
+void Version::ref() { ++refs_; }
 
 void Version::Unref() {
   assert(this != &vset_->dummy_versions_);
@@ -1331,6 +1331,9 @@ FileMetaData* FindSmallestBoundaryFile(
   FileMetaData* smallest_boundary_file = nullptr;
   for (size_t i = 0; i < level_files.size(); ++i) {
     FileMetaData* f = level_files[i];
+    // gy: first compare user key in dictionary order. If same, then compare seq nums, smaller
+    // seq num is "greater".
+    // As a result, here we get records with the same user key, but older version.
     if (icmp.Compare(f->smallest, largest_key) > 0 &&
         user_cmp->Compare(f->smallest.user_key(), largest_key.user_key()) ==
             0) {
@@ -1386,9 +1389,11 @@ void VersionSet::SetupOtherInputs(Compaction* c) {
   const int level = c->level();
   InternalKey smallest, largest;
 
+  // gy: find all files that have overlapped keys with the target files
   AddBoundaryInputs(icmp_, current_->files_[level], &c->inputs_[0]);
   GetRange(c->inputs_[0], &smallest, &largest);
 
+  // gy: find files that have overlapped keys in next level
   current_->GetOverlappingInputs(level + 1, &smallest, &largest,
                                  &c->inputs_[1]);
   AddBoundaryInputs(icmp_, current_->files_[level + 1], &c->inputs_[1]);

@@ -1,0 +1,14 @@
+* LevelDB Cache
+
+LevelDB implements a in-memory cache by LRU strategy. It is a standard LRU implementation that uses double linked-lists to store nodes, and a hash table to find node in $$O(1)$$ complexity.
+
+LevelDB uses cache for opened files and blocks of sstable during read.
+
+** Cache Structure (=cache.cc=)
+A cache is represented by ~LRUCache~ and a node in the cache is represented by ~LRUHandle~. There are two lists for each cache, one stores in using nodes, another one store nodes that are not currently reference by clients.
+
+A ~LRUCache~ is not used directly, instead, LevelDB creates a ~SharedLRUCache~ that contains 16 ~LRUCache~s.
+
+** HashTable
+The hashtable that LevelDB uses is very flat. Like normal hashtable impletation, we have an array of buckets where each bucket is a linked list. However, LevelDB grows the size of the array aggresively. If the number of items in the hashtable is reach to the length of the array, LevelDB will expand the array size two times.
+

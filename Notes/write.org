@@ -1,0 +1,105 @@
+* LevelDB Write Path
+
+There are two main write related APIs: ~Put()~ and ~Delete()~. Both of them use ~Batch~ and the ~Write()~ to do the real work.
+
+#+begin_src cpp
+// there is only one option that we can choose, sync or not
+  Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
+    WriteBatch batch;
+    batch.Put(key, value);
+    return Write(opt, &batch);
+  }
+
+  Status DB::Delete(const WriteOptions& opt, const Slice& key) {
+    WriteBatch batch;
+    batch.Delete(key);
+    return Write(opt, &batch);
+  }
+#+end_src
+
+Updates (include delete) only happens in the in-memory memtable.
+
+** Slice (=slice.h=)
+~Slice~ is a simple structure that has two fields: ~data_~ and ~size_~. A ~Slice~ can be treat as a pointer to some external storage with a given start memory and size.
+
+** WriteBatch (=write_batch.h=)
+#+begin_quote
+~WriteBatch~ holds a collection of updates to apply atomically to a DB.
+#+end_quote
+
+The atomicity actually is provided by external syncrhonization. Only ~const~ member functions of ~WriteBatch~ do not need that (of course!).
+
+~WriteBatch~ provides some APIs such as ~Put()~, ~Delete()~, and ~Append()~ to add contents into the batch. ~WriteBatch~ takes ~Slice~ as parameters to get a KV pair.
+
+Since LevelDB treat all contents as string, ~WriteBatch~ uses a string internally to represent(i.e., store) these contents. To embeded metadata, the start of the represent string is header. And the following contents are contents from users.
+
+The header is total 12 bytes: 8 bytes for the sequence number, and 4 bytes for counter.
+The counter tell how many records we have in this batch.
+The sequence number works like a timestamp or id for a specific key and is used as part of the DB's internal key. We will talk more about this in memtable part.
+
+The structure of a record in the batch is like:
+#+begin_src 
+type + key_len + key_str + val_len + var_str
+#+end_src
+
+=type= is 1 byte, the size of =key_len= and =val_len= is ~size_t~. 
+
+** Write (=db_impl.h=)
+
+#+begin_src cpp
+  // Just shows the framework, not the full code
+  Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+    writers_.push_back(&w);
+    // zgy: waits for prev writers to finish
+    while (!w.done && &w != writers_.front()) {
+      w.cv.Wait();
+    }
+    if (w.done) {
+      return w.status;
+    }
+    // do we need compaction?
+    Status status = MakeRoomForWrite(updates == nullptr);
+
+    if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+      WriteBatch* write_batch = BuildBatchGroup(&last_writer); // zyg: try to group existing batches into one
+
+	// WAL 
+	status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+
+	if (status.ok()) {
+	  // write to the memtable
+	  status = WriteBatchInternal::InsertInto(write_batch, mem_);
+	}
+    }
+
+    // Notify new head of write queue
+    if (!writers_.empty()) {
+      writers_.front()->cv.Signal();
+    }
+
+    return status;
+  }
+
+#+end_src
+
+The caller of ~Write()~ does not do the write operation directly, instead, it creats a  ~Writer~ and adds it to a global ~deque~ called ~writers_~.
+The caller only process the write request when its ~Writer~ is at the front of ~writers_~.
+
+There is an optimization in the write path. Instead of only sending the ~WriteBatch~ the caller needs out, we will also try to group following batches of other ~Writer~s in the ~writers_~.
+
+Before insert the update into the memtable, we call ~MakeRoomForWrite()~ to determine if we need to flush out current memtable or trigger compactions.
+
+Then, we first append a new record to the log to ensure atomicity and consistency. If this is a sync write, we will sync the log immediately.
+
+After logging, we insert the write batches to the memtable ~mem_~.
+
+We will talk more details about compaction, logging, and memtable in dedicated notes.
+
+*** ~WriteBatchInternal::InsertInto()~
+Write batch accpets a ~Handler~, then use that handler to insert KV pairs in the batch to a specific destination.
+
+In the normal write path thrugh ~InsertInto()~, the handler is ~MemTableInserter~. The ~Iterate()~ method of ~WriteBatch~ will add KV pairs one by one to the current memtable through ~MemTableInserter~.
+
+This is a really good design. The ~WriteBatch~ becomes a write component, both data and methods that need for a write request is all encapculated to a batch object. Do not to worry about shared data.
+
+Both ~Put()~ and ~Delete()~ utilize ~MemTable~'s ~Add()~ method to add entries. In terms of put, we add key and values; for delete, the value part is just a empty ~Slice~ (so, value size 0 means delete). 

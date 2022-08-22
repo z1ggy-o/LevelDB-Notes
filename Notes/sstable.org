@@ -1,0 +1,156 @@
+* LevelDB SSTable
+
+As we tablked in [[file:memtable.org][the memtable note]], in current implementation, memtables are just skiplists that each node of the list contains a write record.
+
+SSTable is much more complicate than memtable because we need to consider how to cover the disadvantage of LSM-Tree (i.e., the bad read performance). LevelDB uses three things to improve the read performance: index, bloom filter, and compression.
+
+If it is possible LevelDB will try to compact the data before store it into the sstable file, which reduces the amount of I/O. With bloom filter and index, we can find the target record more quickly and reduce unnecessary reading.
+
+** SSTable File Format (=table_builder.h=, =table/format.h=)
+
+Now, let's talk about the format of sstable files.
+
+The file is divided into fix-sized blocks, the default block size is 4KB. There are four types of blocks:
+- Data blocks:  records
+- Filter blocks: bloom filters
+- Index blocks: tell where is a data block (offset)
+- Meta index blocks: tell where is a filter block (offset)
+
+Besides these blocks, the end of each file has a /footer/ region, which tells the offset of index blocks and meta index blocks.
+
+In each blocks, in addition to the block contents, there is a /block trailer/ that contains a 1 byte compression type and 32-bit CRC. The type field tells if the content in the block is compressed.
+
+A sstable file is created by in ~TableBuilder~ class. There is a ~Table~ class, however, it is used for reading and caching. Here, we focus on the write part. The source code itself does not tell the format of sstable directly, instead, read the =table_format.md= documentation file to learn the details. Here is the format description from the doc file:
+
+#+begin_src
+      <beginning_of_file>
+      [data block 1]
+      [data block 2]
+      ...
+      [data block N]
+      [meta block 1] (e.g., filter block)
+      ...
+      [meta block K]
+      [metaindex block]
+      [index block]
+      [Footer]        (fixed size; starts at file_size - sizeof(Footer))
+      <end_of_file>
+#+end_src
+
+*** Data blocks 
+To reduce some storage cost and find record faster, LevelDB provides a interesting data block format:
+#+begin_src
+ START
+ ------------- // a group
+ record
+ ...
+ record
+ -------------
+ group
+ -------------
+ ...
+ -------------
+ restart_point
+ ...
+ -------------
+ restart_point lenght
+ -------------
+ END
+
+ // record format
+ <shared_len><non_shared_len><value_size><unshared_key><value>
+#+end_src
+
+Several number of records are organized as a group (by default, 16 records). For records in a group, LevelDB compares the key of two consecutive records and find the common prefix. The later record does not store the common prefix but only get the length of it (=shard_len=), which reduces some storage cost.
+
+For each group, we get a =restart_point= that point to the first entry of that group. Since it is the first entry, it has a full key instead of a compressed one.
+
+During read process, we can compare the key of the entry that a restart point points to, which can reduce some key comparison.
+
+*** Meta blocks
+There are two types of =meta blocks=: filter block and stats block. We mainly focus on filter blocks. The filter block itself has a specified format, which includes indexes for fileter entries.
+
+#+begin_src 
+    [filter 0]
+    [filter 1]
+    [filter 2]
+    ...
+    [filter N-1]
+
+    [offset of filter 0]                  : 4 bytes
+    [offset of filter 1]                  : 4 bytes
+    [offset of filter 2]                  : 4 bytes
+    ...
+    [offset of filter N-1]                : 4 bytes
+
+    [offset of beginning of offset array] : 4 bytes
+    lg(base)                              : 1 byte
+#+end_src
+
+By default, LevelDB creates a filter for keys in each 2KB chunk.
+
+*** Meta index blocks and index blocks
+
+In terms of =meta index= and =index= blocks, they store the offset of data blocks and meta blocks. The offset itself represented by a struct ~BlockHandle~, which shows the offset and size.
+
+*** Footer
+
+And finally, the footer is here. 
+#+begin_src 
+        metaindex_handle: char[p];     // Block handle for metaindex
+        index_handle:     char[q];     // Block handle for index
+        padding:          char[40-p-q];// zeroed bytes to make fixed length
+                                       // (40==2*BlockHandle::kMaxEncodedLength)
+        magic:            fixed64;     // == 0xdb4775248b80fb57 (little-endian)
+#+end_src
+
+The footer itself only tells us where is the =index= and =metaindex=, so we can find and use them to get the data block that contains the
+
+** Write Out a SSTable (=builder.h=, =table_builder.h=, =block_builder.h=)
+
+When a memtable is full, LevelDB turns it to be a immutable memtable and calls ~WriteLevel0Table()~ to flush the memtable out as a sstable file.
+
+~BuildTable()~ handle the job with the help from ~TableBuilder~ and ~BlockBuilder~.
+
+#+begin_src cpp
+  Status BuildTable(const std::string& dbname, Env* env, const Options& options,
+		    TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
+    // only core functions here
+
+      TableBuilder* builder = new TableBuilder(options, file);
+
+      meta->smallest.DecodeFrom(iter->key()); // entries are sorted in memtable, so the first one must be the smallest
+      Slice key;
+      for (; iter->Valid(); iter->Next()) {
+	key = iter->key();
+	builder->Add(key, iter->value()); // generates data_block, filter block, and index block 
+      }
+      if (!key.empty()) {
+	meta->largest.DecodeFrom(key);
+      }
+
+      // Write out filter block, meta index block, index block and the footer 
+      s = builder->Finish();
+
+      // Finish and check for file errors
+      if (s.ok()) {
+	s = file->Sync(); // Make sure the file is persisted, instead of only in the OS page cache
+      }
+      if (s.ok()) {
+	s = file->Close();
+      }
+#+end_src
+
+Data block, index block, and filter block have their own ~BlockBuilder~ to create block for them.
+
+Data blocks are written to the file during the iteration when a block is full. I assume the reason is to reduce the memory assumption (we can have a lot of data). Other block are written out at the final ~Finish()~ funtion.
+
+We do not talk about the details about the ~BlockBuilder~ since it just create blocks following the previous discussed block formats.
+
+** SStables in different levels
+
+LevelDB, as its name suggests, organizes sstable into different levels. Level 0 sstables are persisted memtables. Other higher level sstables are created through compaction.
+
+Level 0 sstables may contain overlapped key ranges, however, sstables in higher levels do not.
+
+This characteristic affects the design of compaction and read process. We will talk about the detail in the corresponding parts.

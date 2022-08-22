@@ -1,0 +1,73 @@
+* LevelDB MemTable
+
+The global ~mem_~ pointer points to the current memtable that hanldes write request.
+
+** Add Entry into MemTable (=memtalbe.h=)
+The ~Add()~ method of ~MemTable~ is used to insert new entry to the table.
+
+The format of an entry is as follows:
+#+begin_src cpp
+  // Format of an entry is concatenation of:
+  //  key_size     : varint32 of internal_key.size()
+  //  key bytes    : char[internal_key.size()]
+  //  tag          : uint64((sequence << 8) | type)
+  //  value_size   : varint32 of value.size()
+  //  value bytes  : char[value.size()]
+#+end_src
+
+In LevelDB all entries in tables (both memtable and sstable) are sorted by their key. However, the "key" is not the key we get from the user input, but an internal key that generated base on the user key.
+
+The format of the internal key is: =user key + sequence number (7-byte) + type (1-byte)=. The sequence number and type are from write batches.
+
+~Add()~ simply creates a entry then inserts it to the memtable. You can defined your own table if you want, the defailt table is a skiplist.
+
+** The SkipList (=skiplist.h=)
+
+LevelDB by default uses skiplist as the internal memtable data structure. It is defined as a template that can accept different types of key types and key comparators.
+
+People say the power of skiplist is easy to implement. This is true, the implementation that LevelDB provides is not more than 380 LOC, comments included.
+
+The node of skiplist is quite simple, it has a key field and an array of pointers that point to the next node in for each height. The "key" is the entry that ~Add()~ generates, so we do not another field for values.
+
+Use insert as an example:
+1. Find all prev nodes by searching nodes that contain keys that greater or equal to the given key. We also get the "next" node for the given key in this procedure.
+   1. Search from list head at the max height, if the next node's is smaller than the given key, we keep searching at this level
+   2. If the given key is greater and this is not the base level, we go to the next level and keep searching. Every time we go to the next level, that node is the "prev" node for the insert key.
+2. Create a new node for the given key and add this node into the lists. Since we get all prev nodes previously, this is easy to do.
+
+Other methods of the skiplist is also very easy to understand. Read the source code if you want to know more details.
+
+** Flush in-memory data to disks (=memtable.h=, =db_impl.h=, =env.h=)
+
+There are two ~MemTalbe~ for each DB, one handles write requests (~mem_~), the other one is immutable and can only handle read request (~imm_~). They work like the double-buffer strategy, when current ~MemTable~ is full, it will switch to another ~MemTable~, and the full ~MemTable~ is flushed out in the background.
+
+Every time we try to put new contents to the DB, we will check if there is enough space in ~mem_~. If not, we will try to swap the ~MemTable~ and trigger compaction.
+
+There are two kinds of compactions in LevelDB. Flushing memtable out to disks is called /minor compaction/ and removing stale contents in persisted sstable is called /major compaction/. Both compactions are triggerred here.
+
+There is a background thread that responsible to handle compactions, the whole compaction logic is implemented in function ~DBImpl::BackgroundCompaction()~. Here, we only talk about memtable flushing, or minor compaction.
+
+#+begin_src cpp
+  // only core code, check all details in source code
+  void DBImpl::CompactMemTable() {
+      Status s = WriteLevel0Table(imm_, &edit, base);
+
+      // Replace immutable memtable with the generated Table
+      if (s.ok()) {
+	edit.SetPrevLogNumber(0);
+	edit.SetLogNumber(logfile_number_);  // Earlier logs no longer needed
+	s = versions_->LogAndApply(&edit, &mutex_); // will create a new version here
+      }
+
+      if (s.ok()) {
+	// Commit to the new state
+	has_imm_.store(false, std::memory_order_release);
+	RemoveObsoleteFiles();
+      }
+    }
+
+#+end_src
+
+From the above code we can tell, the core of minor compaction is write the memtable into disk as a level 0 sstable, which is handled by function ~WriteLevel0Table()~. We iterate the memtable to build a table then flush it out as a sstable file.
+
+The details about sstable is discussed in its own notes.
