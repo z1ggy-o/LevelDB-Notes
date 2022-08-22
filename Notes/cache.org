@@ -1,6 +1,6 @@
 * LevelDB Cache
 
-LevelDB implements a in-memory cache by LRU strategy. It is a standard LRU implementation that uses double linked-lists to store nodes, and a hash table to find node in $$O(1)$$ complexity.
+LevelDB implements a in-memory cache by LRU strategy. It is a standard LRU implementation that uses double linked-lists to store nodes, and a hash table to find node in $O(1)$ complexity.
 
 LevelDB uses cache for opened files and blocks of sstable during read.
 
