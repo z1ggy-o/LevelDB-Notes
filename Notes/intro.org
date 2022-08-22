@@ -1,0 +1,20 @@
+* LevelDB Code Analysis Introduction
+
+I recently spent few days to learn LSM-Tree by reading the LevelDB source code. Instead of commenting the source code, I wrote some notes about the main components. In case the code changes later, I upload both the source code that I read and the notes together here.
+
+These notes are not very comprehensive but focus on linking the general LSM-Tree design ideas with the specific LevelDB implementation.
+
+I split the each component into its own note file. You can choose any note to begin reading. However, because I took these notes during reading the notes, the contents do have some connections.
+
+More specifically, I let the write operation to lead me go through the journey. I think the memtable and sstable are the most important structures and learn them first. Then, I check the compaction code. Later, I read the version and cache related parts. Finally, I learn the read path based knowledge from previous components. If you like, you can follow the same path:
+
+1. [[file:write.org][Write related APIs]]
+2. [[file:memtable.org][Memtable]]
+3. [[file:logging.org][Logging]]
+4. [[file:sstable.org][SSTable]]
+5. [[file:compaction.org][Compaction]]
+6. [[file:verstions.org][Versions]]
+7. [[file:cache.org][Cache]]
+8. [[file:read.org][Read Path]]
+
+Before reading my notes, I highly recommend you to read the offical documentation under the =/doc= directory. And this [[https://leveldb-handbook.readthedocs.io/zh/latest/basic.html][blog]] contains many pretty figures that really help me to better understand the source code (it is based on goleveldb, but most implements share the same idea).
